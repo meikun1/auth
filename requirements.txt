@@ -1,0 +1,4 @@
+telethon>=1.34
+aiohttp>=3.9
+pysocks>=1.7
+python-socks[asyncio]>=2.4
