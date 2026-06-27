@@ -44,6 +44,28 @@ from telethon.tl.types import (
 
 
 # ────────────────────────────────────────────────────────
+#  .env loader — чтобы не вписывать CODEAPI_* при каждом запуске
+# ────────────────────────────────────────────────────────
+def _load_dotenv():
+    """Подхватывает KEY=VALUE из файла .env рядом со скриптом в os.environ,
+    НЕ перетирая уже заданные переменные (реальный env имеет приоритет).
+    Формат: по строке KEY=VALUE, # — комментарий, кавычки опциональны."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
+
+# ────────────────────────────────────────────────────────
 #  Конфиг
 # ────────────────────────────────────────────────────────
 
