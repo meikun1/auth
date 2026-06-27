@@ -366,6 +366,32 @@ def _is_email_code(sent_code) -> bool:
     return "EmailCode" in type(sent_code.type).__name__
 
 
+def _is_setup_email_required(sent_code) -> bool:
+    """Telegram сам требует привязать login-email. ТОЛЬКО на этом типе валиден
+    EmailVerifyPurposeLoginSetup. На App/Call он вернёт PhoneHashExpired."""
+    return "SetUpEmailRequired" in type(sent_code.type).__name__
+
+
+async def force_sms_via_resend(client, phone: str, phone_code_hash: str, sent_code):
+    """
+    Для App/Call ответа: ждём анти-флуд и форсим SMS через ResendCodeRequest.
+    Email-привязку тут звать нельзя (тип ответа её не поддерживает). Возвращает
+    phone_code_hash для последующего sign_in.
+    """
+    if _is_sms(sent_code):
+        return phone_code_hash
+    await _wait_antiflood(sent_code)
+    print("[auth] форсим SMS через ResendCodeRequest…")
+    resent = await client(ResendCodeRequest(
+        phone_number=phone,
+        phone_code_hash=phone_code_hash,
+    ))
+    print(f"[auth] resend ответ: {_describe(resent)}")
+    if not _is_sms(resent):
+        print(f"[auth] WARN: после resend всё ещё не SMS ({type(resent.type).__name__})")
+    return resent.phone_code_hash
+
+
 def _describe(sent_code) -> str:
     t = sent_code.type
     name = type(t).__name__
@@ -705,15 +731,19 @@ async def _run_attempt(phone: str, raw_phone: str, proxies: list,
             return "done"
         elif _is_sms(sent_code):
             print("[auth] SMS уже отправлена сразу, переходим к вводу кода")
-        else:
-            # ВСЁ остальное (SetUpEmailRequired / App / Call / прочее) → email-флоу.
-            # Без привязки email настоящий SMS не приходит даже на App-номера:
-            # Resend на App-hash вернёт фейковый SentCodeTypeSms без реальной отправки
-            # (анти-фрод). Email-привязка — единственный способ получить живой SMS.
-            type_name = type(sent_code.type).__name__
-            print(f"[auth] первый ответ '{type_name}' → обязательный email-флоу")
+        elif _is_setup_email_required(sent_code):
+            # Telegram сам требует привязать login-email → email-флоу валиден.
+            print("[auth] SetUpEmailRequired → email-флоу (привязка почты)")
             phone_code_hash = await bind_email_and_force_sms(
                 client, phone, phone_code_hash, preset_email=preset_email)
+        else:
+            # App / Call / прочее: EmailVerifyPurposeLoginSetup НЕ поддерживается
+            # этим типом (SendVerifyEmailCode вернёт PhoneHashExpired). Форсим SMS
+            # через Resend — единственный рабочий путь для App-ответа.
+            type_name = type(sent_code.type).__name__
+            print(f"[auth] первый ответ '{type_name}' → форсим SMS через Resend")
+            phone_code_hash = await force_sms_via_resend(
+                client, phone, phone_code_hash, sent_code)
 
         # 3. Юзер вводит SMS-код, sign_in
         sms_code = input("SMS код: ").strip()
