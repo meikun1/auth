@@ -6,14 +6,15 @@ Flow:
   2. Выбираем рандомный SOCKS5 прокси из GERNETh.txt
   3. SendCodeRequest (+ reCAPTCHA solver если телега требует)
   4. Классификация ответа:
-       - SetUpEmailRequired → email-флоу (юзер вводит email + код с почты)
+       - SetUpEmailRequired → email-флоу (адрес и код с почты — авто через
+         Code API при заданном CODEAPI_TOKEN, иначе ручной ввод)
        - App / Call / прочее не-SMS → ResendCodeRequest для форса SMS (без email)
        - SMS → сразу к sign_in
        - EmailCode (чужая почта) → STOP
   5. Юзер вводит SMS-код → sign_in → готово
   6. verify_session_live() — 12 сек пингов на отзыв auth_key
 
-Без temp-mail, без бота. 2FA → фейл.
+Email-флоу автоматизирован через Code API (mailserver/), без бота. 2FA → фейл.
 """
 
 import asyncio
@@ -32,6 +33,7 @@ from telethon.tl.functions.account import (
     VerifyEmailRequest,
 )
 from telethon.tl.functions.auth import ResendCodeRequest, SendCodeRequest
+from telethon.tl.functions.help import GetNearestDcRequest
 from telethon.tl.functions.users import GetUsersRequest
 from telethon.tl.types import (
     CodeSettings,
@@ -55,6 +57,24 @@ CAPTCHA_MAX_RETRIES = 3
 CAPTCHA_POLL_INTERVAL = 5
 CAPTCHA_POLL_TIMEOUT = 180
 
+# Сколько ждать перед ResendCodeRequest для форса SMS. Telegram отдаёт свой
+# анти-флуд timeout (обычно 60s); ждём min(его, RESEND_WAIT_MAX). Слишком
+# короткое ожидание → сервер может вернуть фейковый SentCodeTypeSms без реальной SMS.
+# Крутится через env: RESEND_WAIT_MAX=30 python auth.py
+try:
+    RESEND_WAIT_MAX = int(os.environ.get("RESEND_WAIT_MAX", "15"))
+except ValueError:
+    RESEND_WAIT_MAX = 15
+
+# Сколько раз пробовать авторизацию заново при PhoneHashExpiredError.
+# Каждая попытка берёт НОВУЮ рандомную прокси + новый fingerprint + новый
+# phone_code_hash — это лечит "плохой IP", из-за которого хэш протухает мгновенно.
+# Крутится через env: AUTH_RETRY_MAX=5 python auth.py
+try:
+    AUTH_RETRY_MAX = int(os.environ.get("AUTH_RETRY_MAX", "3"))
+except ValueError:
+    AUTH_RETRY_MAX = 3
+
 # Проверка живости сессии после sign_in.
 # Делаем N пингов GetUsers(self) с интервалом, ловим AuthKeyUnregisteredError —
 # если Telegram сразу отозвал ключ (юзер кикнул с телефона / антифрод сервера) — поймаем.
@@ -63,6 +83,18 @@ LIVE_CHECK_INTERVAL = 2  # секунд между пингами → сумма
 
 SESSIONS_DIR = "sessions"
 PROXIES_FILE = "GERNETh.txt"  # формат строк: login:pass@host:port (SOCKS5)
+
+# ────────────────────────────────────────────────────────
+#  Code API — catch-all почтовый сервер (mailserver/, veximail.space)
+# ────────────────────────────────────────────────────────
+# Если CODEAPI_TOKEN задан (env или константой ниже) — email-флоу полностью
+# автоматический: адрес берётся через /address/new, код с почты вычитывается
+# через /codes/latest?to=<addr>. Если токен пуст — фолбэк на ручной ввод
+# (старое поведение). Токен лежит на сервере в /etc/codeapi/env.
+CODEAPI_BASE = os.environ.get("CODEAPI_BASE", "https://mail.veximail.space:8443")
+CODEAPI_TOKEN = os.environ.get("CODEAPI_TOKEN", "")
+CODEAPI_POLL_INTERVAL = 3    # секунд между опросами /codes/latest
+CODEAPI_POLL_TIMEOUT = 120   # сколько всего ждём письмо с кодом
 
 DEVICES = [
     ("Samsung Galaxy S23", "Android 13"),
@@ -316,32 +348,18 @@ def _is_sms(sent_code) -> bool:
     return "Sms" in type(sent_code.type).__name__
 
 
-def _is_setup_email_required(sent_code) -> bool:
-    return "SetUpEmailRequired" in type(sent_code.type).__name__
-
-
-async def force_sms_via_resend(client, phone: str, phone_code_hash: str, sent_code) -> str:
+async def _wait_antiflood(sent_code) -> None:
     """
-    Принудительный SMS через ResendCodeRequest. ВАЖНО: Telegram блокирует Resend
-    анти-флудом на N секунд (`sent_code.timeout`). Если дёрнуть Resend до истечения
-    timeout — сервер вернёт фейковый SentCodeTypeSms, но реально SMS не отправит.
-    Поэтому ждём timeout перед запросом.
+    Ждём перед ResendCodeRequest. Telegram блокирует Resend анти-флудом на
+    `sent_code.timeout` секунд (обычно 60). Если дёрнуть Resend раньше — сервер
+    вернёт фейковый SentCodeTypeSms, но реально SMS не отправит. Ждём
+    min(timeout, RESEND_WAIT_MAX), чтобы получить настоящий SMS.
     """
     timeout = getattr(sent_code, "timeout", 0) or 60
-    next_type = type(getattr(sent_code, "next_type", None)).__name__ if getattr(sent_code, "next_type", None) else "?"
-    print(f"[auth] timeout до Resend: {timeout}s, next_type={next_type}")
-    print(f"[auth] ждём {timeout}s чтобы Telegram реально отправил SMS (анти-флуд)…")
-    await asyncio.sleep(timeout)
-
-    print("[auth] форсим SMS через ResendCodeRequest…")
-    resent = await client(ResendCodeRequest(
-        phone_number=phone,
-        phone_code_hash=phone_code_hash,
-    ))
-    print(f"[auth] resend ответ: {_describe(resent)}")
-    if not _is_sms(resent):
-        print(f"[auth] WARN: после resend всё ещё не SMS ({type(resent.type).__name__})")
-    return resent.phone_code_hash
+    wait = min(timeout, RESEND_WAIT_MAX)
+    print(f"[auth] timeout до Resend: {timeout}s (ждём {wait}s)")
+    print(f"[auth] ждём {wait}s чтобы Telegram реально отправил SMS (анти-флуд)…")
+    await asyncio.sleep(wait)
 
 
 def _is_email_code(sent_code) -> bool:
@@ -458,16 +476,91 @@ async def send_code_with_captcha(client, phone: str):
 
 
 # ────────────────────────────────────────────────────────
+#  Code API клиент (генерация адреса + чтение кода с почты)
+# ────────────────────────────────────────────────────────
+
+def _codeapi_enabled() -> bool:
+    return bool(CODEAPI_TOKEN)
+
+
+def _codeapi_headers() -> dict:
+    return {"Authorization": f"Bearer {CODEAPI_TOKEN}"}
+
+
+async def codeapi_new_address() -> str:
+    """Запрашивает случайный адрес *@veximail.space через /address/new."""
+    url = f"{CODEAPI_BASE}/address/new"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=_codeapi_headers()) as resp:
+            resp.raise_for_status()
+            data = await resp.json(content_type=None)
+    return data["address"]
+
+
+async def codeapi_wait_code(address: str) -> str:
+    """
+    Поллит /codes/latest?to=<address> пока не появится код или не истечёт
+    CODEAPI_POLL_TIMEOUT. Адрес одноразовый и случайный, поэтому любой код
+    для него — заведомо свежий (нет риска поймать старый код).
+    """
+    url = f"{CODEAPI_BASE}/codes/latest"
+    params = {"to": address}
+    elapsed = 0
+    async with aiohttp.ClientSession() as session:
+        while elapsed < CODEAPI_POLL_TIMEOUT:
+            await asyncio.sleep(CODEAPI_POLL_INTERVAL)
+            elapsed += CODEAPI_POLL_INTERVAL
+            try:
+                async with session.get(url, params=params, headers=_codeapi_headers()) as resp:
+                    if resp.status == 404:
+                        if elapsed % 15 == 0:
+                            print(f"[codeapi] ждём код… ({elapsed}s)")
+                        continue
+                    resp.raise_for_status()
+                    data = await resp.json(content_type=None)
+            except Exception as e:
+                print(f"[codeapi] poll error: {e}")
+                continue
+            code = data.get("code")
+            if code:
+                print(f"[codeapi] код получен за {elapsed}s "
+                      f"(service={data.get('service')}, from={data.get('from')})")
+                return code
+    print(f"[codeapi] таймаут {CODEAPI_POLL_TIMEOUT}s — код не пришёл")
+    return ""
+
+
+# ────────────────────────────────────────────────────────
 #  Привязка email
 # ────────────────────────────────────────────────────────
 
-async def bind_email_and_force_sms(client, phone: str, phone_code_hash: str):
+async def bind_email_and_force_sms(client, phone: str, phone_code_hash: str,
+                                   preset_email: str = ""):
     """
-    Юзер вводит email + код с почты → верификация → форсим SMS.
-    Возвращает обновлённый phone_code_hash после форса SMS.
+    Привязка email + код с почты → верификация → форсим SMS.
+    Если Code API сконфигурирован — адрес и код берутся автоматически,
+    иначе используем заранее введённый preset_email (фолбэк на input()).
+    Возвращает phone_code_hash после форса SMS.
+
+    ВАЖНО: между SendCodeRequest и SendVerifyEmailCodeRequest НЕЛЬЗЯ блокировать
+    event-loop ручным input() — phone_code_hash живёт недолго и блокирующий ввод
+    замораживает соединение Telethon, из-за чего хэш протухает (PhoneHashExpired).
+    Поэтому email должен быть готов ДО входа сюда (см. authorize()).
     """
     print("\n[auth] === ПРИВЯЗКА EMAIL ===")
-    email = input("Email: ").strip()
+
+    auto = _codeapi_enabled()
+    if auto:
+        try:
+            email = await codeapi_new_address()
+            print(f"[auth] адрес от Code API: {email}")
+        except Exception as e:
+            print(f"[auth] Code API недоступен ({e}) → ручной ввод")
+            auto = False
+            email = preset_email or input("Email: ").strip()
+    else:
+        email = preset_email or input("Email: ").strip()
+    print(f"[auth] email для привязки: {email}")
 
     purpose = EmailVerifyPurposeLoginSetup(
         phone_number=phone,
@@ -481,7 +574,14 @@ async def bind_email_and_force_sms(client, phone: str, phone_code_hash: str):
     ))
     print(f"[auth] код отправлен (длина {sent_email.length})")
 
-    email_code = input("Код с почты: ").strip()
+    email_code = ""
+    if auto:
+        print(f"[auth] ждём код на {email} через Code API…")
+        email_code = await codeapi_wait_code(email)
+        if not email_code:
+            print("[auth] Code API код не дал → ручной ввод")
+    if not email_code:
+        email_code = input("Код с почты: ").strip()
 
     print("[auth] верифицируем email…")
     result = await client(VerifyEmailRequest(
@@ -498,6 +598,7 @@ async def bind_email_and_force_sms(client, phone: str, phone_code_hash: str):
             print("[auth] SMS уже отправлена")
             return new_hash
 
+        await _wait_antiflood(result.sent_code)
         print("[auth] не SMS — форсим ResendCodeRequest…")
         resent = await client(ResendCodeRequest(
             phone_number=phone,
@@ -515,6 +616,7 @@ async def bind_email_and_force_sms(client, phone: str, phone_code_hash: str):
     print(f"[auth] ответ: {_describe(sent_code2)}")
 
     if not _is_sms(sent_code2):
+        await _wait_antiflood(sent_code2)
         print("[auth] не SMS — форсим Resend…")
         resent = await client(ResendCodeRequest(
             phone_number=phone,
@@ -530,18 +632,18 @@ async def bind_email_and_force_sms(client, phone: str, phone_code_hash: str):
 #  Главный flow
 # ────────────────────────────────────────────────────────
 
-async def authorize():
-    raw_phone = input("Номер (с + или без): ").strip().lstrip("+")
-    if not raw_phone or not raw_phone.isdigit():
-        print("[auth] невалидный номер")
-        return
-    phone = f"+{raw_phone}"
-
+async def _run_attempt(phone: str, raw_phone: str, proxies: list,
+                       preset_email: str = "") -> str:
+    """
+    Одна попытка авторизации с собственной прокси и fingerprint.
+    Возвращает:
+      "done"  — закончили (успех или терминальный стоп), ретраить НЕ надо
+      "retry" — PhoneHashExpired (плохой IP) → имеет смысл новая прокси
+    """
     model, sys_ver = random.choice(DEVICES)
     app_ver = random.choice(APP_VERSIONS)
     print(f"[auth] fingerprint: {model} / {sys_ver} / TG {app_ver}")
 
-    proxies = load_proxies()
     proxy = pick_random_proxy(proxies)
     if proxies:
         print(f"[auth] прокси: {_proxy_label(proxy)} (из {len(proxies)} в пуле)")
@@ -570,14 +672,26 @@ async def authorize():
             me = await client.get_me()
             print(f"[auth] уже авторизован: {me.first_name} ({me.phone})")
             await client.disconnect()
-            return
+            return "done"
+
+        # 0. Прогрев соединения + диагностика: какую страну Telegram видит по нашему IP.
+        # GetNearestDc — безобидный неавторизованный запрос, устанавливает связь до
+        # чувствительного SendCode и возвращает country по IP. Если country != UZ —
+        # это и есть "плохой IP", из-за которого email-привязка валит PhoneHashExpired.
+        try:
+            nd = await client(GetNearestDcRequest())
+            flag = "✓" if nd.country.upper() == "UZ" else "✗ НЕ UZ — вероятная причина PhoneHashExpired"
+            print(f"[auth] Telegram видит IP как: country={nd.country} "
+                  f"(this_dc={nd.this_dc}, nearest_dc={nd.nearest_dc}) {flag}")
+        except Exception as e:
+            print(f"[auth] прогрев GetNearestDc не прошёл: {type(e).__name__}: {e}")
 
         # 1. SendCode (с капчей если нужно)
         sent_code = await send_code_with_captcha(client, phone)
         if not sent_code:
             print("[auth] SendCode провалился")
             await _cleanup(client)
-            return
+            return "done"
 
         phone_code_hash = sent_code.phone_code_hash
         print(f"[auth] первый ответ: {_describe(sent_code)}")
@@ -588,20 +702,18 @@ async def authorize():
             email_pattern = getattr(sent_code.type, "email_pattern", "?")
             print(f"[auth] STOP — чужая почта привязана ({email_pattern})")
             await _cleanup(client)
-            return
+            return "done"
         elif _is_sms(sent_code):
             print("[auth] SMS уже отправлена сразу, переходим к вводу кода")
-        elif _is_setup_email_required(sent_code):
-            # Email НЕ привязан → Telegram требует setup → email-флоу
-            print("[auth] email НЕ привязан → email-флоу (юзер вводит почту и код)")
-            phone_code_hash = await bind_email_and_force_sms(client, phone, phone_code_hash)
         else:
-            # SentCodeTypeApp / Call / прочее — email привязан (либо активная сессия).
-            # email-setup тут невозможен (PhoneHashExpired), но Resend после timeout
-            # должен дать настоящий SMS. Ждём sent_code.timeout перед Resend.
+            # ВСЁ остальное (SetUpEmailRequired / App / Call / прочее) → email-флоу.
+            # Без привязки email настоящий SMS не приходит даже на App-номера:
+            # Resend на App-hash вернёт фейковый SentCodeTypeSms без реальной отправки
+            # (анти-фрод). Email-привязка — единственный способ получить живой SMS.
             type_name = type(sent_code.type).__name__
-            print(f"[auth] первый ответ '{type_name}' → ждём timeout + Resend для реального SMS")
-            phone_code_hash = await force_sms_via_resend(client, phone, phone_code_hash, sent_code)
+            print(f"[auth] первый ответ '{type_name}' → обязательный email-флоу")
+            phone_code_hash = await bind_email_and_force_sms(
+                client, phone, phone_code_hash, preset_email=preset_email)
 
         # 3. Юзер вводит SMS-код, sign_in
         sms_code = input("SMS код: ").strip()
@@ -615,15 +727,15 @@ async def authorize():
         except errors.SessionPasswordNeededError:
             print("[auth] STOP — на акке 2FA, обработка не реализована")
             await _cleanup(client)
-            return
+            return "done"
         except errors.PhoneCodeInvalidError:
             print("[auth] неверный SMS код")
             await _cleanup(client)
-            return
+            return "done"
         except errors.PhoneCodeExpiredError:
             print("[auth] SMS код протух")
             await _cleanup(client)
-            return
+            return "done"
 
         me = await client.get_me()
         print(f"\n[auth] ✓ sign_in успешен: {me.first_name} (@{me.username or '-'}) | {me.phone}")
@@ -637,14 +749,51 @@ async def authorize():
             print(f"\n[auth] ✗ СЕССИЯ МЁРТВАЯ — auth_key отозван (вероятно тапнули 'Завершить' в Telegram)")
             print(f"[auth] удаляю битый файл сессии…")
             await _cleanup(client)
-            return
+            return "done"
 
         await client.disconnect()
+        return "done"
 
+    except errors.PhoneHashExpiredError as e:
+        # Плохой IP/прокси: Telegram инвалидирует phone_code_hash почти сразу.
+        # Сигналим наверх, чтобы попробовать заново с другой прокси.
+        print(f"[auth] PhoneHashExpired на прокси {_proxy_label(proxy)}: {e}")
+        await _cleanup(client)
+        return "retry"
     except Exception as e:
         print(f"[auth] непредвиденная ошибка: {type(e).__name__}: {e}")
         await _cleanup(client)
-        sys.exit(1)
+        return "done"
+
+
+async def authorize():
+    raw_phone = input("Номер (с + или без): ").strip().lstrip("+")
+    if not raw_phone or not raw_phone.isdigit():
+        print("[auth] невалидный номер")
+        return
+    phone = f"+{raw_phone}"
+
+    proxies = load_proxies()
+
+    # Email собираем ЗАРАНЕЕ (до SendCodeRequest), чтобы внутри email-флоу не было
+    # блокирующего input() между SendCode и SendVerifyEmailCode — иначе хэш протухает
+    # (PhoneHashExpired). При включённом Code API адрес берётся автоматически.
+    preset_email = ""
+    if not _codeapi_enabled():
+        preset_email = input("Email для привязки (Enter — спросить позже): ").strip()
+
+    for attempt in range(1, AUTH_RETRY_MAX + 1):
+        print(f"\n[auth] ═══ ПОПЫТКА {attempt}/{AUTH_RETRY_MAX} ═══")
+        status = await _run_attempt(phone, raw_phone, proxies, preset_email)
+        if status != "retry":
+            return
+        if attempt < AUTH_RETRY_MAX:
+            print("[auth] PhoneHashExpired → берём новую прокси и пробуем заново…\n")
+
+    print(f"\n[auth] ✗ исчерпаны {AUTH_RETRY_MAX} попытки — PhoneHashExpired на каждой.")
+    print("[auth] вероятно прокси не подходят региону номера (поменяй пул в "
+          f"{PROXIES_FILE} на прокси ближе к стране номера).")
+    sys.exit(1)
 
 
 if __name__ == "__main__":
